@@ -1,0 +1,229 @@
+---
+- name: Set up Spigot Minecraft server
+  hosts: localhost
+  become: yes
+  vars:
+    minecraft_user: minecraft
+    server_directory: /home/{{ minecraft_user }}/server
+    buildtools_directory: /home/{{ minecraft_user }}/buildtools
+
+  tasks:
+    - name: Gathering Facts
+      setup:
+
+    - name: Uninstall existing JDK
+      apt:
+        name: openjdk-*
+        state: absent
+
+    - name: Install OpenJDK 17
+      apt:
+        name: openjdk-17-jdk
+        state: present
+        update_cache: yes
+
+    - name: Install required packages
+      apt:
+        name: "{{ item }}"
+        state: present
+        update_cache: yes
+      loop:
+        - apt-transport-https
+        - cron
+        - ddclient
+        - git
+        - gnupg
+        - nano
+        - openssh-server
+        - openvpn
+        - screen
+        - ufw
+        - wget
+
+    - name: Allow OpenSSH
+      ufw:
+        rule: allow
+        port: 22
+
+    - name: Allow Minecraft server port
+      ufw:
+        rule: allow
+        port: 25565
+
+    - name: Create 'minecraft' user
+      user:
+        name: "{{ minecraft_user }}"
+        home: "/home/{{ minecraft_user }}"
+        shell: /bin/bash
+        createhome: yes
+
+    - name: Create buildtools and server directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ minecraft_user }}"
+        group: "{{ minecraft_user }}"
+        mode: 0755
+      loop:
+        - "{{ buildtools_directory }}"
+        - "{{ server_directory }}"
+
+    - name: Download and build Spigot
+      become_user: "{{ minecraft_user }}"
+      shell: "wget -O {{ buildtools_directory }}/BuildTools.jar https://hub.spigotmc.org/jenkins/job/BuildTools/lastSuccessfulBuild/artifact/target/BuildTools.jar && java -jar {{ buildtools_directory }}/BuildTools.jar"
+      args:
+        chdir: "{{ buildtools_directory }}"
+
+    - name: Create start script for Spigot server
+      become_user: minecraft
+      copy:
+        content: |
+          #!/bin/sh
+          java -Xms6G -Xmx6G -XX:+UseG1GC -XX:+ParallelRefProcEnabled -XX:MaxGCPauseMillis=200 -XX:+UnlockExperimentalVMOptions -XX:+DisableExplicitGC -XX:+AlwaysPreTouch -XX:G1NewSizePercent=30 -XX:G1MaxNewSizePercent=40 -XX:G1HeapRegionSize=8M -XX:G1ReservePercent=20 -XX:G1HeapWastePercent=5 -XX:G1MixedGCCountTarget=4 -XX:InitiatingHeapOccupancyPercent=15 -XX:G1MixedGCLiveThresholdPercent=90 -XX:G1RSetUpdatingPauseTimePercent=5 -XX:SurvivorRatio=32 -XX:+PerfDisableSharedMem -XX:MaxTenuringThreshold=1 -Dusing.aikars.flags=https://mcflags.emc.gs -Daikars.new.flags=true -jar /home/minecraft/server/spigot.jar nogui
+        dest: /home/minecraft/server/spigotstart.sh
+        mode: '0755'
+
+    - name: Create update script for OS
+      become_user: minecraft
+      copy:
+        content: |
+          #!/bin/bash
+          # Update server packages
+          apt update && apt upgrade -y
+          # Run security updates
+          apt-get --only-upgrade install -y unattended-upgrades
+        dest: /home/minecraft/server/update_server_OS.sh
+        mode: '0755'
+
+    - name: Create update script for Spigot
+      become_user: minecraft
+      copy:
+        content: |
+          #!/bin/bash
+          # Prompt for backup directory
+          read -p "Enter the backup directory path: " backup_directory
+          # Create backup directory if it doesn't exist
+          mkdir -p "$backup_directory"
+          # Backup the server
+          tar -cvf "$backup_directory/$(date '+%Y-%m-%d_%H-%M-%S').tar" "{{ server_directory }}"
+          # Download and build the latest Spigot
+          cd "{{ buildtools_directory }}"
+          wget -O BuildTools.jar https://hub.spigotmc.org/jenkins/job/BuildTools/lastSuccessfulBuild/artifact/target/BuildTools.jar
+          java -jar BuildTools.jar
+          # Move the newly built Spigot server file
+          cp spigot-*.jar "{{ server_directory }}/spigot.jar"
+        dest: /home/minecraft/server/update_spigot.sh
+        mode: '0755'
+
+    - name: Create world backup script
+      become_user: minecraft
+      copy:
+        content: |
+          #!/bin/bash
+          # Escape special characters in the world name
+          world_name=$(printf '%q' "$1")
+          # Get the destination folder
+          destination_folder="$2"
+          # Create the backup directory if it doesn't exist
+          mkdir -p "$destination_folder"
+          # Backup the server
+          tar -cvf "$destination_folder/$(date '+%Y-%m-%d_%H-%M-%S').tar" "{{ server_directory }}/$world_name"
+        dest: /home/minecraft/server/world_backup_script.sh
+        mode: '0755'
+
+    - name: Start Spigot server once
+      become_user: "{{ minecraft_user }}"
+      command: "sudo -u minecraft screen -dmS minecraft {{ server_directory }}/spigotstart.sh"
+      args:
+        chdir: "{{ server_directory }}"
+      ignore_errors: yes
+      register: server_output
+
+    - name: Print Server Log
+      debug:
+        var: server_output.stdout_lines
+
+    - name: Accept Minecraft EULA
+      become_user: "{{ minecraft_user }}"
+      command: echo "eula=true" > eula.txt
+      args:
+        chdir: "{{ server_directory }}"
+
+    - name: Stop Spigot server
+      become_user: "{{ minecraft_user }}"
+      shell: "screen -S minecraft -p 0 -X stuff 'stop\n'"
+      args:
+        chdir: "{{ server_directory }}"
+      ignore_errors: yes
+
+    - name: Wait for server to stop
+      pause:
+        seconds: 10
+
+    - name: Create Spigot service
+      copy:
+        dest: /etc/systemd/system/spigot.service
+        content: |
+          [Unit]
+          Description=SpigotMC
+          After=network.target
+
+          [Service]
+          Type=forking
+          User=minecraft
+          Group=minecraft
+          ExecStart=/usr/bin/screen -d -m -S minecraft /home/minecraft/server/spigotstart.sh
+          ExecStop=/usr/bin/screen -S minecraft -p 0 -X stuff "stop$(printf \\r)"
+          WorkingDirectory=/home/minecraft/server
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: Restart Spigot service
+
+    - name: Start Spigot server
+      become_user: "{{ minecraft_user }}"
+      command: "sudo -u minecraft screen -dmS minecraft {{ server_directory }}/spigotstart.sh"
+      args:
+        chdir: "{{ server_directory }}"
+      ignore_errors: yes
+      register: server_output
+
+    - name: Create cron job for server updates
+      cron:
+        name: Minecraft Server Update
+        minute: "0"
+        hour: "4"
+        job: "/home/minecraft/server/update_server.sh"
+
+    - name: Generate documentation
+      copy:
+        content: |
+          Minecraft Server Documentation
+          ----------------------------
+
+          Deployment Method: Ansible
+
+          Automations:
+          - Daily server update cron job (4 AM).
+
+          Available functions:
+          - Start the server: sudo systemctl start spigot
+          - Stop the server: sudo systemctl stop spigot
+          - Restart the server: sudo systemctl restart spigot
+
+          Update Scripts:
+          - Server Update: /home/minecraft/server/update_server.sh
+          - Spigot Update: /home/minecraft/server/update_spigot.sh
+
+          World Backup:
+          - Usage: /path/to/world_backup_script.sh "world_name" "destination_folder"
+
+        dest: "{{ server_directory }}/readme.txt"
+
+    - name: Print Server Log
+      debug:
+        var: server_output.stdout_lines
+
+    - name: Debug Server Log
+      debug:
+        var: server_output
