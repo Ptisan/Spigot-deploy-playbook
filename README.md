@@ -26,4 +26,4 @@ Update Scripts:
 - Spigot Update: /home/minecraft/server/update_spigot.sh
 
 World Backup:
-- Usage: /path/to/world_backup_script.sh "world_name" "destination_folder"
+- Usage: /home/minecraft/server/world_backup_script.sh "world_name" "destination_folder"
